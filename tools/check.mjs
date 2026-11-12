@@ -1,4 +1,5 @@
-// Checks the four issues against a mocked incident API, so no real ack is spent before the recording.
+// Checks the four issues, product's decision and the ack race against a mocked incident API,
+// so no real ack is spent before the recording.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
@@ -34,10 +35,11 @@ const base = [
 
 const browser = await chromium.launch({ channel: 'msedge' });
 
-async function openBoard({ locale, timezone, incidents, hostname }) {
-  const context = await browser.newContext({ locale, timezoneId: timezone, viewport: { width: 1100, height: 620 } });
+async function openBoard({ locale, timezone, incidents }) {
+  const context = await browser.newContext({ locale, timezoneId: timezone, viewport: { width: 1100, height: 720 } });
   const page = await context.newPage();
   const acks = [];
+  let current = incidents;
   await page.route('https://hq.mega.dev/challenges/show-me-when/api/**', async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith('/ack')) {
@@ -47,10 +49,10 @@ async function openBoard({ locale, timezone, incidents, hostname }) {
       return;
     }
     await new Promise((r) => setTimeout(r, 400));
-    await route.fulfill({ json: { updatedAt: new Date().toISOString(), incidents, cursor: `c${Date.now()}` } });
+    await route.fulfill({ json: { updatedAt: new Date().toISOString(), incidents: current, cursor: `c${Date.now()}` } });
   });
   await page.goto(`http://localhost:${port}/`);
-  return { context, page, acks };
+  return { context, page, acks, setIncidents: (next) => (current = next) };
 }
 
 // R3: loader shows on open and is gone once incidents are on screen.
@@ -63,6 +65,8 @@ async function openBoard({ locale, timezone, incidents, hostname }) {
   check('R6 build-sha in footer', (await page.locator('[data-testid="build-sha"]').textContent()) === 'dev');
   check('R6 meta build present', (await page.locator('meta[name="build"]').getAttribute('content')) === 'dev');
   check('empty hidden when rows exist', !(await page.locator('[data-testid="empty"]').isVisible()));
+  check('R2 no Ack button in a row', (await page.locator('[data-testid="incident-row"] [data-testid="ack"]').count()) === 0);
+  check('panel hidden until a row is opened', !(await page.locator('[data-testid="incident-panel"]').isVisible()));
   await context.close();
 }
 
@@ -81,29 +85,56 @@ async function openBoard({ locale, timezone, incidents, hostname }) {
     new Intl.DateTimeFormat(undefined, { dateStyle: 'short' }).format(new Date('2026-11-12T03:03:00Z')),
   );
   check('R5 Auckland shows 16:03 local, day before month', aucklandText.includes('16:03') && /\b12[./]11/.test(aucklandText), aucklandText);
-  check('R5 order comes from the viewer, not a fixed format', /\b12[./]11/.test(inPageOrder), `${inPageOrder} / ${await auckland.page.evaluate(() => navigator.language)}`);
+  check('R5 order comes from the viewer, not a fixed format', /\b12[./]11/.test(inPageOrder), inPageOrder);
   await auckland.context.close();
 }
 
-// R2: Ack sends the ack and marks the row; R4: a new incident arrives at the top without a reload.
+// R2 + product's decision: a row opens the panel, the panel holds the Ack, and it acks that incident.
 {
-  const { context, page, acks } = await openBoard({ locale: 'de-DE', timezone: 'Europe/Berlin', incidents: [...base] });
+  const { context, page, acks } = await openBoard({ locale: 'de-DE', timezone: 'Europe/Berlin', incidents: base });
   await page.locator('[data-testid="incident-row"]').first().waitFor();
-  await page.locator('[data-testid="incident-row"] [data-testid="ack"]').first().click();
-  await page.locator('[data-testid="incident-row"] [data-testid="acked"]').first().waitFor();
-  check('R2 ack called once for the clicked row', acks.length === 1 && acks[0].id === 'INC-1002');
+  await page.locator('[data-testid="incident-row"][data-id="INC-1002"]').click();
+  const panel = page.locator('[data-testid="incident-panel"]');
+  await panel.waitFor({ state: 'visible' });
+  check('row opens the panel for that incident', (await panel.getAttribute('data-id')) === 'INC-1002');
+  check('panel names the incident id', (await panel.textContent()).includes('INC-1002'));
+  check('panel holds the only Ack', (await page.locator('[data-testid="panel-ack"]').count()) === 1);
+  await page.locator('[data-testid="panel-ack"]').click();
+  await page.locator('[data-testid="incident-row"][data-id="INC-1002"] [data-testid="acked"]').waitFor();
+  check('R2 one ack for the panel incident', acks.length === 1 && acks[0].id === 'INC-1002');
   check('R2 row marked acked', (await page.locator('[data-id="INC-1002"] [data-testid="acked"]').count()) === 1);
-  check('R2 acked row has no Ack button', (await page.locator('[data-id="INC-1002"] [data-testid="ack"]').count()) === 0);
+  check('panel shows it is acked', (await panel.textContent()).includes("I've got this"));
+  check('a second click cannot ack twice', (await page.locator('[data-testid="panel-ack"]').count()) === 0);
+  await context.close();
+}
 
-  const next = [{ id: 'INC-1003', service: 'notify', region: 'eu-west-1', summary: 'pager fan-out stuck', severity: 'sev1', openedAt: '2026-11-12T03:10:00.000Z' }, ...base];
-  await page.route('https://hq.mega.dev/challenges/show-me-when/api/**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.pathname.endsWith('/ack')) return route.fulfill({ json: { id: url.searchParams.get('id'), ackedAt: new Date().toISOString(), receipt: 'mock-receipt' } });
-    route.fulfill({ json: { updatedAt: new Date().toISOString(), incidents: next, cursor: `c${Date.now()}` } });
-  });
+// The race from the step-one recording: a row is open, an incident lands and shifts the list,
+// and the ack still names the incident the panel is open on.
+{
+  const { context, page, acks, setIncidents } = await openBoard({ locale: 'de-DE', timezone: 'Europe/Berlin', incidents: [...base] });
+  await page.locator('[data-testid="incident-row"]').first().waitFor();
+
+  await page.locator('[data-testid="incident-row"][data-id="INC-1001"]').click();
+  const panel = page.locator('[data-testid="incident-panel"]');
+  await panel.waitFor({ state: 'visible' });
+  check('panel open on the row that was clicked', (await panel.getAttribute('data-id')) === 'INC-1001');
+
+  setIncidents([
+    { id: 'INC-1003', service: 'notify', region: 'eu-west-1', summary: 'pager fan-out stuck', severity: 'sev1', openedAt: '2026-11-12T03:10:00.000Z' },
+    ...base,
+  ]);
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="incident-row"]').length === 3, null, { timeout: 6000 });
   check('R1 new incident at the top without reload', (await page.locator('[data-testid="incident-row"]').first().getAttribute('data-id')) === 'INC-1003');
-  check('R2 ack mark survives a refresh', (await page.locator('[data-id="INC-1002"] [data-testid="acked"]').count()) === 1);
+  check('panel keeps the incident it was opened on', (await panel.getAttribute('data-id')) === 'INC-1001');
+
+  await page.locator('[data-testid="panel-ack"]').click();
+  await page.locator('[data-testid="incident-row"][data-id="INC-1001"] [data-testid="acked"]').waitFor();
+  check('ack names the panel incident, not the newcomer', acks.length === 1 && acks[0].id === 'INC-1001', acks[0]?.id);
+  check('newcomer stays unacked', (await page.locator('[data-id="INC-1003"] [data-testid="acked"]').count()) === 0);
+  check('acked mark survives a refresh', (await page.locator('[data-id="INC-1001"] [data-testid="acked"]').count()) === 1);
+
+  await panel.locator('.panel-close').click();
+  check('panel closes', !(await panel.isVisible()));
   await context.close();
 }
 
